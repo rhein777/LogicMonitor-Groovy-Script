@@ -1,0 +1,276 @@
+/*******************************************************************************
+ * © 2007-2021 - LogicMonitor, Inc. All rights reserved.
+ ******************************************************************************/
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.time.TimeCategory
+import com.santaba.agent.util.Settings
+
+
+// To run in debug mode, set to true
+def debug = true
+
+def host = hostProps.get("system.hostname")
+def proxyInfo = getProxyInfo(debug)
+
+
+baseUrl = "https://${host}/portal/rest"
+slurper = new JsonSlurper()
+
+// If no default CookieManager, then instantiate and set as new default
+def cookieManager = CookieManager.getDefault()
+if (!cookieManager) {
+    cookieManager = new CookieManager()
+    cookieManager.setDefault(cookieManager)
+    if (debug) println "Instantiated and set new default CookieManager: ${cookieManager}"
+}
+
+// Authenticate for subsequent API calls
+def auth = getAuthToken(hostProps, proxyInfo, debug)
+
+if (auth) {
+    // Establish date format and time parameters
+    def start
+    def end = new Date()
+    LMDebugPrint("Current collector time: ${end}", debug)
+
+    // Time range here isn't important, we just want to verify success
+    use(TimeCategory) {
+        start = (end - 60.minutes)
+    }
+
+    // Convert date to format and UTC required by API
+    def dateFormat = "yyyy-MM-dd'T'HH:mm:ss.s'Z'"
+    TimeZone tz = TimeZone.getTimeZone("UTC")
+
+    end = end.format(dateFormat, tz)
+    start = start.format(dateFormat, tz)
+    LMDebugPrint("Time reformatted and converted to UTC (if necessary) for API calls: ${end}\n", debug)
+
+    // Test endpoints used in this suite spanning privilege requirements
+    try {
+        // Get enterprise IDs from host prop or dynamically
+        def eID = hostProps.get("velo.enterpriseIds") ?: getEnterpriseId(proxyInfo, debug)
+
+        // Exit early if we don't have enterprise IDs and direct customer to issue
+        if (!eID) {
+            println "No enterprise IDs.  Check user permissions or manually assign in host properties as velo.enterpriseIds."
+            return 1
+        }
+
+        // This call is expected to work for all logins and covers all priviledges required for this suite
+        metricUrl = "${baseUrl}/monitoring/getAggregateEdgeLinkMetrics"
+        // Gets aggregate link metrics for the request interval for all active links across all enterprises, where a link is considered to be active 
+        // if an Edge has reported any activity for it in the last 24 hours. On success, returns an array of network utilization metrics, one per link.
+        // Privileges required:  READ ENTERPRISE & READ EDGE
+        body = [
+            "interval": ["end": end, "start": start]
+        ]
+        def edgeLinks = postRequest(metricUrl, body, proxyInfo, debug)
+
+        if (edgeLinks) {
+            LMDebugPrint("Required permissions present to successfully retrieve data in this suite.", debug)
+        }
+        else {
+            LMDebugPrint("WARNING - Insufficient permissions for this suite.  Ensure this user has read permissions for enterprises and edges.", debug)
+        }
+
+        // If the above calls return successfully, add system category
+        println "system.categories=VeloCloudAPI"
+    }
+    finally {
+        logout(proxyInfo, debug)
+    }
+}
+else {
+    println "Unable to authenticate.  Verify your credentials outside of LogicMonitor and check device properties."
+    return 1
+}
+
+return 0
+
+
+/**
+ * Helper function to print out debug messages for troubleshooting purposes.
+ */
+def LMDebugPrint(message, debug=false) {
+    if (debug) {
+        println(message.toString())
+    }
+}
+
+
+/* 
+ * Get collector proxy settings
+ */
+def getProxyInfo(debug=false) {
+    def deviceProxy = hostProps.get("proxy.enable")?.toBoolean() ?: true // default to true in absence of property to use collectorProxy as determinant
+    def collectorProxy = Settings.getSetting("proxy.enable")?.toBoolean() ?: false // if settings are not present, value should be false
+    Map proxyInfo = [:]
+    
+    if (deviceProxy && collectorProxy) {
+        proxyInfo = [
+            enabled : true,
+            host : hostProps.get("proxy.host") ?: Settings.getSetting("proxy.host"),
+            port : hostProps.get("proxy.port") ?: Settings.getSetting("proxy.port"),
+            user : Settings.getSetting("proxy.user"),
+            pass : Settings.getSetting("proxy.pass")
+        ]
+    
+        proxyInfo["proxy"] = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyInfo.host, proxyInfo.port.toInteger()))
+    }
+
+    if (proxyInfo.enabled) {
+        LMDebugPrint("""Proxy enabled -
+        Host:  ${proxyInfo.host}
+        Port:  ${proxyInfo.port}
+        """, debug)
+    }
+
+    return proxyInfo
+}
+
+
+/**
+ * Helper function to retrieve auth token
+*/
+def getAuthToken(hostProps, proxyInfo, debug=false) {
+    def url = "${baseUrl}/login/enterpriseLogin"
+    def user = hostProps.get("velo.user")
+    def pass = hostProps.get("velo.pass")
+    LMDebugPrint("Attempting authentication with user: ${user}", debug)
+    
+    // Set cookie variable for checking login success
+    cookie = CookieHandler.getDefault().getCookieStore().getCookies()
+
+    def body = [
+        "username": "${user}",
+        "password": "${pass}"
+    ]
+
+    def response = postRequest(url, body, proxyInfo, debug)
+
+    if (cookie.findAll{ it.toString().startsWith("velocloud.session") }) {
+        return true
+    }
+    else {
+        LMDebugPrint("Enterprise login failed, attempting operator login...", debug)
+
+        url = "${baseUrl}/login/operatorLogin"
+        response = postRequest(url, body, proxyInfo, debug)
+  
+        if (cookie.findAll{ it.toString().startsWith("velocloud.session") }) {
+            return true
+        }
+        else {
+            return false
+        }
+    }
+}
+
+
+/**
+ * Helper function to retrieve enterprise ID
+*/
+def getEnterpriseId(proxyInfo, debug) {
+    // The API call to retrieve enterprise IDs varies based on user-defined permissions
+    // Try one, then try another if the first fails to return results
+    def url = "${baseUrl}enterpriseProxy/getEnterpriseProxyEnterprises"
+    def response = postRequest(url, [:], proxyInfo, debug)
+
+    if (!response) {
+        url = "${baseUrl}/network/getNetworkEnterprises"
+        response = postRequest(url, [:], proxyInfo, debug)
+    }
+
+    def id = (response) ? response.id : false
+
+    return id
+}
+
+
+/**
+ * Helper function to log out of established session
+*/
+def logout(proxyInfo, debug) {
+    def url = "${baseUrl}/logout"
+    LMDebugPrint("Logging out of session...", debug)
+    postRequest(url, [:], proxyInfo, debug)
+}
+
+
+/**
+ * Helper function to make API POST request and return response
+*/
+def postRequest(url, body, proxyInfo, debug, alreadyFailed=false) {
+    def statusCode
+    def message
+    def response
+
+    try {
+        // Establish connection based on proxyInfo
+        if (proxyInfo.enabled) { 
+            LMDebugPrint("\tAttempting with proxy...", debug)
+            client = new URL(url).openConnection(proxyInfo.proxy)
+        }
+        else { client = new URL(url).openConnection() }
+
+        client.setRequestMethod("POST")
+        client.addRequestProperty('Content-Type', 'application/json')
+        client.setDoOutput(true)
+
+        client.getOutputStream().write(JsonOutput.toJson(body).getBytes("UTF-8"))
+
+        statusCode = client.getResponseCode()
+        message    = client.getResponseMessage()
+        response   = client.getInputStream().getText()
+
+        if (statusCode == 200 && (!response.contains("html"))) {
+            // For calls that return response data, parse to check for additional errors
+            if (response != "") {
+                def results = slurper.parseText(response)
+
+                // Some responses return 200 when there is actually a problem
+                if (results?.error?.message?.contains("tokenError")) {
+                    if (alreadyFailed) {
+                        LMDebugPrint("TOKEN ERROR CAUGHT; UNABLE TO REAUTHENTICATE", debug)
+                        LMDebugPrint("CALL FAILED\n\tURL: ${url}\n\tERROR CODE: ${results.error.code}\tMESSAGE: ${results.error.message}\n", debug)
+                        return false
+                    }
+                    // Reauthenticate and try again
+                    LMDebugPrint("Token expired, reauthenicating and trying again...", debug)
+                    auth = getAuthToken(hostProps, proxyInfo, debug)
+                    return postRequest(url, body, proxyInfo, debug, alreadyFailed=true)
+                }
+                else if (results?.error?.code) {
+                    LMDebugPrint("CALL FAILED\n\tURL: ${url}\n\tERROR CODE: ${results.error.code}\tMESSAGE: ${results.error.message}\n", debug)
+                    return false
+                }
+                else {
+                    LMDebugPrint("SUCCESS\n\tURL: ${url}\n\tSTATUS: ${statusCode}\tMESSAGE: ${message}\n", debug)
+                    return results
+                }
+            }
+            // Calls that do not return response data, but meet other conditions to this point are good
+            // e.g. login/logout
+            else {
+                LMDebugPrint("SUCCESS\n\tURL: ${url}\n\tSTATUS: ${statusCode}\tMESSAGE: ${message}\n", debug)
+                return true
+            }
+        } 
+        else {
+            if (response.contains("html")) {
+                LMDebugPrint("AUTHENTICATION FAILED; Received login page\n\tURL: ${url}\n", debug)
+            }
+            else {
+                LMDebugPrint("CALL FAILED\n\tURL: ${url}\n\tSTATUS: ${statusCode}\tMESSAGE: ${message}\n", debug)
+            }
+            return false
+        }
+    }
+    catch (Exception e) {
+        LMDebugPrint("CALL FAILED\n\tURL: ${url}\n\tEXCEPTION: ${e}\n", debug)
+        return false
+    }
+}
